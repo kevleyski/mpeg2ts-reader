@@ -320,6 +320,7 @@ pub enum FilterRequest<'a, 'buf> {
 struct PmtProcessor<Ctx: DemuxContext> {
     pid: packet::Pid,
     program_number: u16,
+    #[allow(dead_code)]
     current_version: Option<u8>,
     filters_registered: fixedbitset::FixedBitSet,
     phantom: marker::PhantomData<Ctx>,
@@ -459,6 +460,7 @@ impl<Ctx: DemuxContext> PacketFilter for PmtPacketFilter<Ctx> {
 }
 
 struct PatProcessor<Ctx: DemuxContext> {
+    #[allow(dead_code)]
     current_version: Option<u8>,
     filters_registered: fixedbitset::FixedBitSet, // TODO: https://crates.io/crates/typenum_bitset ?
     phantom: marker::PhantomData<Ctx>,
