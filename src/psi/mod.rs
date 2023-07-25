@@ -70,7 +70,7 @@ pub trait SectionProcessor {
 }
 
 /// Represents the value of the Transport Stream `current_next_indicator` field.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CurrentNext {
     /// The section version number applies to the currently applicable section data
     Current,
@@ -577,14 +577,14 @@ where
             self.ignore_rest = true;
             return;
         }
-        if data.len() < SectionCommonHeader::SIZE + TableSyntaxHeader::SIZE {
-            warn!("SectionSyntaxSectionProcessor data {} too short for header {} (TODO: implement buffering)", data.len(), SectionCommonHeader::SIZE + TableSyntaxHeader::SIZE);
+        if data.len() < SectionCommonHeader::SIZE {
+            warn!("CompactSyntaxSectionProcessor data {} too short for header {} (TODO: implement buffering)", data.len(), SectionCommonHeader::SIZE + TableSyntaxHeader::SIZE);
             self.ignore_rest = true;
             return;
         }
         if header.section_length > Self::SECTION_LIMIT {
             warn!(
-                "SectionSyntaxSectionProcessor section_length={} is too large (limit {})",
+                "CompactSyntaxSectionProcessor section_length={} is too large (limit {})",
                 header.section_length,
                 Self::SECTION_LIMIT
             );
@@ -782,39 +782,24 @@ where
 mod test {
     use super::*;
     use crate::demultiplex;
+    use crate::demultiplex::PacketFilter;
     use crate::packet::Packet;
     use hex_literal::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    packet_filter_switch! {
-        NullFilterSwitch<NullDemuxContext> {
-            Pat: demultiplex::PatPacketFilter<NullDemuxContext>,
-            Pmt: demultiplex::PmtPacketFilter<NullDemuxContext>,
-            Nul: demultiplex::NullPacketFilter<NullDemuxContext>,
+    pub struct NullFilterSwitch;
+    impl PacketFilter for NullFilterSwitch {
+        type Ctx = NullDemuxContext;
+        fn consume(&mut self, _ctx: &mut Self::Ctx, _pk: &Packet<'_>) {
+            unimplemented!()
         }
     }
+
     demux_context!(NullDemuxContext, NullFilterSwitch);
     impl NullDemuxContext {
-        fn do_construct(&mut self, req: demultiplex::FilterRequest<'_, '_>) -> NullFilterSwitch {
-            match req {
-                demultiplex::FilterRequest::ByPid(packet::Pid::PAT) => {
-                    NullFilterSwitch::Pat(demultiplex::PatPacketFilter::default())
-                }
-                demultiplex::FilterRequest::ByPid(_) => {
-                    NullFilterSwitch::Nul(demultiplex::NullPacketFilter::default())
-                }
-                demultiplex::FilterRequest::ByStream { .. } => {
-                    NullFilterSwitch::Nul(demultiplex::NullPacketFilter::default())
-                }
-                demultiplex::FilterRequest::Pmt {
-                    pid,
-                    program_number,
-                } => NullFilterSwitch::Pmt(demultiplex::PmtPacketFilter::new(pid, program_number)),
-                demultiplex::FilterRequest::Nit { .. } => {
-                    NullFilterSwitch::Nul(demultiplex::NullPacketFilter::default())
-                }
-            }
+        fn do_construct(&mut self, _req: demultiplex::FilterRequest<'_, '_>) -> NullFilterSwitch {
+            unimplemented!()
         }
     }
 
@@ -862,7 +847,7 @@ mod test {
         let state = Rc::new(RefCell::new(false));
         struct MockSectParse {
             state: Rc<RefCell<bool>>,
-        };
+        }
         impl WholeSectionSyntaxPayloadParser for MockSectParse {
             type Context = ();
             fn section<'a>(
@@ -923,5 +908,221 @@ mod test {
         }
 
         assert!(*state.borrow());
+    }
+
+    #[test]
+    fn table_syntax() {
+        let sect = hex!("4084e90000");
+        let header = TableSyntaxHeader::new(&sect);
+        assert_eq!(header.current_next_indicator(), CurrentNext::Current);
+        assert_eq!(header.id(), 16516);
+        assert_eq!(header.section_number(), 0);
+        assert_eq!(header.last_section_number(), 0);
+        assert_eq!(header.version(), 20);
+        // smoke test Debug impl (e.g. should not panic!)
+        assert!(!format!("{:?}", header).is_empty());
+    }
+
+    #[test]
+    fn dedup_section() {
+        struct CallCounts {
+            start: usize,
+            cont: usize,
+            reset: usize,
+        }
+        struct Mock {
+            inner: Rc<RefCell<CallCounts>>,
+        }
+        let counts = Rc::new(RefCell::new(CallCounts {
+            start: 0,
+            cont: 0,
+            reset: 0,
+        }));
+        impl SectionSyntaxPayloadParser for Mock {
+            type Context = ();
+
+            fn start_syntax_section<'a>(
+                &mut self,
+                _ctx: &mut Self::Context,
+                _header: &SectionCommonHeader,
+                _table_syntax_header: &TableSyntaxHeader<'a>,
+                _data: &'a [u8],
+            ) {
+                self.inner.borrow_mut().start += 1;
+            }
+
+            fn continue_syntax_section<'a>(&mut self, _ctx: &mut Self::Context, _data: &'a [u8]) {
+                self.inner.borrow_mut().cont += 1;
+            }
+
+            fn reset(&mut self) {
+                self.inner.borrow_mut().reset += 1;
+            }
+        }
+        let mut dedup = DedupSectionSyntaxPayloadParser::new(Mock {
+            inner: counts.clone(),
+        });
+
+        let sect = hex!("42f130 4084e90000");
+
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        let table_header = TableSyntaxHeader::new(&sect[SectionCommonHeader::SIZE..]);
+        assert_eq!(table_header.version(), 20);
+
+        let ctx = &mut ();
+        dedup.start_syntax_section(ctx, &common_header, &table_header, &[]);
+        dedup.continue_syntax_section(ctx, &[]);
+        assert_eq!(counts.borrow().start, 1);
+        assert_eq!(counts.borrow().cont, 1);
+        // now we submit a table header with the same version,
+        dedup.start_syntax_section(ctx, &common_header, &table_header, &[]);
+        dedup.continue_syntax_section(ctx, &[]);
+        // still 1
+        assert_eq!(counts.borrow().start, 1);
+        assert_eq!(counts.borrow().cont, 1);
+
+        // now lets use the same section header as above but with an updated version
+        let sect = hex!("42f131 4084ea0000");
+
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        let table_header = TableSyntaxHeader::new(&sect[SectionCommonHeader::SIZE..]);
+        assert_eq!(table_header.version(), 21);
+
+        dedup.start_syntax_section(ctx, &common_header, &table_header, &[]);
+        dedup.continue_syntax_section(ctx, &[]);
+        // now 2
+        assert_eq!(counts.borrow().start, 2);
+        assert_eq!(counts.borrow().cont, 2);
+
+        // if we now reset, then the deduplication should no longer be in effect and the submission
+        // of the same section version again should now be passed through to our callback
+
+        assert_eq!(counts.borrow().reset, 0);
+        dedup.reset();
+        assert_eq!(counts.borrow().reset, 1);
+
+        // now 3
+        dedup.start_syntax_section(ctx, &common_header, &table_header, &[]);
+        dedup.continue_syntax_section(ctx, &[]);
+        assert_eq!(counts.borrow().start, 3);
+        assert_eq!(counts.borrow().cont, 3);
+    }
+
+    #[test]
+    fn compact_section_syntax() {
+        struct CallCounts {
+            start: usize,
+        }
+        struct Mock {
+            inner: Rc<RefCell<CallCounts>>,
+        }
+        impl CompactSyntaxPayloadParser for Mock {
+            type Context = ();
+
+            fn start_compact_section<'a>(
+                &mut self,
+                _ctx: &mut Self::Context,
+                _header: &SectionCommonHeader,
+                _data: &'a [u8],
+            ) {
+                self.inner.borrow_mut().start += 1;
+            }
+
+            fn continue_compact_section<'a>(&mut self, _ctx: &mut Self::Context, _data: &'a [u8]) {
+                todo!()
+            }
+
+            fn reset(&mut self) {
+                todo!()
+            }
+        }
+        let counts = Rc::new(RefCell::new(CallCounts { start: 0 }));
+        let mut proc = CompactSyntaxSectionProcessor::new(Mock {
+            inner: counts.clone(),
+        });
+
+        let ctx = &mut ();
+
+        // section_syntax_indicator is 0 in the table header, so this still not be passed through
+        // to the mock
+        let sect = hex!("42f131");
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        assert!(common_header.section_syntax_indicator);
+        proc.start_section(ctx, &common_header, &sect);
+        assert_eq!(0, counts.borrow().start);
+
+        let sect = hex!("427131");
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        assert!(!common_header.section_syntax_indicator);
+        // we trim the data slice down to 2 bytes which should cause the length check inside
+        // CompactSyntaxSectionProcessor to fail,
+        proc.start_section(ctx, &common_header, &sect[..2]);
+        assert_eq!(0, counts.borrow().start);
+
+        // section_length of 1022 (0x3fe) in this header is too long
+        let header = hex!("4273fe");
+        let mut sect = vec![];
+        sect.extend_from_slice(&header);
+        sect.resize(header.len() + 1022, 0); // fill remainder with zeros so we can accidentally fail because the buffer is too short
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        assert!(!common_header.section_syntax_indicator);
+        // we trim the data slice down to 2 bytes which should cause the length check inside
+        // CompactSyntaxSectionProcessor to fail,
+        proc.start_section(ctx, &common_header, &sect);
+        assert_eq!(0, counts.borrow().start);
+
+        // not too long, so this should now be accepted and we should see counts.start increment
+        let sect = hex!("427000");
+        let common_header = SectionCommonHeader::new(&sect[..SectionCommonHeader::SIZE]);
+        assert!(!common_header.section_syntax_indicator);
+        proc.start_section(ctx, &common_header, &sect);
+        assert_eq!(1, counts.borrow().start);
+    }
+
+    #[test]
+    fn buffer_compact() {
+        const SECT: [u8; 7] = hex!("427003 01020304");
+        struct Mock {
+            section_count: usize,
+        }
+        impl WholeCompactSyntaxPayloadParser for Mock {
+            type Context = ();
+
+            fn section<'a>(
+                &mut self,
+                _: &mut Self::Context,
+                header: &SectionCommonHeader,
+                data: &'a [u8],
+            ) {
+                assert_eq!(0x42, header.table_id);
+                // trim of the last byte which we've deliberately supplied, but which is not
+                // supposed to be part of the section
+                assert_eq!(data, &SECT[0..SECT.len() - 1]);
+                self.section_count += 1;
+            }
+        }
+        let mock = Mock { section_count: 0 };
+        let mut parser = BufferCompactSyntaxParser::new(mock);
+        let ctx = &mut ();
+
+        let common_header = SectionCommonHeader::new(&SECT[..SectionCommonHeader::SIZE]);
+
+        // we supply the inital section data, but then reset the BufferCompactSyntaxParser. this
+        // should nave no ill effect on the second attempt where we supply the complete data,
+        parser.start_compact_section(ctx, &common_header, &SECT[..SECT.len() - 3]);
+        parser.reset();
+        assert_eq!(0, parser.parser.section_count);
+
+        parser.start_compact_section(ctx, &common_header, &SECT[..SECT.len() - 3]);
+        parser.continue_compact_section(ctx, &SECT[SECT.len() - 3..SECT.len() - 2]);
+        // this call will deliver 1 byte more than the 2 specified for our section_length, and
+        // that second byte should be ignored
+        parser.continue_compact_section(ctx, &SECT[SECT.len() - 2..]);
+        assert_eq!(1, parser.parser.section_count);
+
+        // the section is already complete, so BufferCompactSyntaxParser should drop any further
+        // data supplied in error
+        parser.continue_compact_section(ctx, &SECT[SECT.len() - 2..]);
+        assert_eq!(1, parser.parser.section_count);
     }
 }

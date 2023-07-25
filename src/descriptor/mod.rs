@@ -27,7 +27,7 @@
 //! // type parameter to descriptors() is inferred from the use of CoreDescriptors below
 //! for d in pmt.descriptors() {
 //!     if let Ok(CoreDescriptors::Registration(reg)) = d {
-//!         println!("registration_descriptor {:#x}", reg.format_identifier());
+//!         println!("registration_descriptor {:?}", reg.format_identifier());
 //!     }
 //! }
 //! ```
@@ -106,7 +106,7 @@ macro_rules! descriptor_enum {
         $name:ident {
             $(
                 $(#[$inner:ident $($args:tt)*])*
-                $case_name:ident $($tags:pat)|* => $t:ident
+                $case_name:ident $($tags:pat_param)|* => $t:ident
             ),*,
         }
     ) => {
@@ -306,27 +306,34 @@ where
         if self.buf.is_empty() {
             return None;
         }
-        let tag = self.buf[0];
-        let len = self.buf[1] as usize;
-        let remaining_size = self.buf.len() - 2;
-        if len > remaining_size {
+        if self.buf.len() < 2 {
+            let buflen = self.buf.len();
             // ensure anther call to next() will yield None,
             self.buf = &self.buf[0..0];
-            Some(Err(DescriptorError::NotEnoughData {
-                tag,
-                actual: remaining_size,
-                expected: len,
-            }))
+            Some(Err(DescriptorError::BufferTooShort { buflen }))
         } else {
-            let (desc, rest) = self.buf.split_at(len + 2);
-            self.buf = rest;
-            Some(Descriptor::from_bytes(desc))
+            let tag = self.buf[0];
+            let len = self.buf[1] as usize;
+            let remaining_size = self.buf.len() - 2;
+            if len > remaining_size {
+                // ensure anther call to next() will yield None,
+                self.buf = &self.buf[0..0];
+                Some(Err(DescriptorError::NotEnoughData {
+                    tag,
+                    actual: remaining_size,
+                    expected: len,
+                }))
+            } else {
+                let (desc, rest) = self.buf.split_at(len + 2);
+                self.buf = rest;
+                Some(Descriptor::from_bytes(desc))
+            }
         }
     }
 }
 
 /// An error during parsing of a descriptor
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DescriptorError {
     /// The amount of data available in the buffer is not enough to hold the descriptor's declared
     /// size.
@@ -352,4 +359,47 @@ pub enum DescriptorError {
     },
     /// There is no mapping defined of the given descriptor tag value to a `Descriptor` value.
     UnhandledTagValue(u8),
+}
+
+pub(crate) fn descriptor_len(buf: &[u8], tag: u8, len: usize) -> Result<(), DescriptorError> {
+    if buf.len() < len {
+        Err(DescriptorError::NotEnoughData {
+            tag,
+            actual: buf.len(),
+            expected: len,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::descriptor::{descriptor_len, CoreDescriptors, DescriptorError, DescriptorIter};
+    use assert_matches::assert_matches;
+    use hex_literal::*;
+
+    #[test]
+    fn core() {
+        let data = hex!("000100");
+        let mut iter = DescriptorIter::<CoreDescriptors<'_>>::new(&data);
+        let desc = iter.next().unwrap();
+        assert!(!format!("{:?}", desc).is_empty());
+        assert_matches!(desc, Ok(CoreDescriptors::Reserved(d)) => {
+            assert_eq!(d.tag, 0);
+            assert_eq!(d.payload, &[0]);
+        });
+    }
+
+    #[test]
+    fn not_enough_data() {
+        assert_matches!(
+            descriptor_len(b"", 0, 1),
+            Err(DescriptorError::NotEnoughData {
+                tag: 0,
+                actual: 0,
+                expected: 1,
+            })
+        );
+    }
 }

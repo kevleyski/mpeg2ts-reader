@@ -2,15 +2,13 @@
 extern crate mpeg2ts_reader;
 
 use mpeg2ts_reader::demultiplex;
+use mpeg2ts_reader::demultiplex::DemuxContext;
+use mpeg2ts_reader::demultiplex::PacketFilter;
+use mpeg2ts_reader::packet::Packet;
 use mpeg2ts_reader::psi;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-
-use mpeg2ts_reader::demultiplex::DemuxContext;
-use mpeg2ts_reader::demultiplex::PacketFilter;
-use mpeg2ts_reader::packet;
-use mpeg2ts_reader::packet::Packet;
 use std::marker;
 
 packet_filter_switch! {
@@ -25,7 +23,7 @@ demux_context!(PcrDumpDemuxContext, PcrDumpFilterSwitch);
 impl PcrDumpDemuxContext {
     fn do_construct(&mut self, req: demultiplex::FilterRequest<'_, '_>) -> PcrDumpFilterSwitch {
         match req {
-            demultiplex::FilterRequest::ByPid(packet::Pid::PAT) => {
+            demultiplex::FilterRequest::ByPid(psi::pat::PAT_PID) => {
                 PcrDumpFilterSwitch::Pat(demultiplex::PatPacketFilter::default())
             }
             demultiplex::FilterRequest::Pmt {
@@ -35,7 +33,13 @@ impl PcrDumpDemuxContext {
 
             demultiplex::FilterRequest::ByStream {
                 pmt, stream_info, ..
-            } => PcrDumpFilterSwitch::Pcr(PcrPacketFilter::construct(pmt, stream_info)),
+            } => {
+                if stream_info.elementary_pid() == pmt.pcr_pid() {
+                    PcrDumpFilterSwitch::Pcr(PcrPacketFilter::construct(pmt, stream_info))
+                } else {
+                    PcrDumpFilterSwitch::Null(demultiplex::NullPacketFilter::default())
+                }
+            }
 
             demultiplex::FilterRequest::ByPid(_) => {
                 PcrDumpFilterSwitch::Null(demultiplex::NullPacketFilter::default())
@@ -75,9 +79,11 @@ impl<Ctx: DemuxContext> PacketFilter for PcrPacketFilter<Ctx> {
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     // open input file named on command line,
     let name = env::args().nth(1).unwrap();
-    let mut f = File::open(&name).expect(&format!("file not found: {}", &name));
+    let mut f = File::open(&name).unwrap_or_else(|_| panic!("file not found: {}", &name));
 
     // create the context object that stores the state of the transport stream demultiplexing
     // process

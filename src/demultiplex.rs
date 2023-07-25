@@ -13,14 +13,13 @@
 //!    [`demux_context!()`](../macro.demux_context.html) macro.
 
 use crate::packet;
+use crate::packet::TransportScramblingControl;
 use crate::psi;
 use crate::psi::pat;
 use crate::psi::pmt::PmtSection;
 use crate::psi::pmt::StreamInfo;
 use crate::StreamType;
-use fixedbitset;
 use log::warn;
-use std;
 use std::marker;
 
 /// Trait to which `Demultiplex` delegates handling of subsets of Transport Stream packets.
@@ -320,8 +319,6 @@ pub enum FilterRequest<'a, 'buf> {
 struct PmtProcessor<Ctx: DemuxContext> {
     pid: packet::Pid,
     program_number: u16,
-    #[allow(dead_code)]
-    current_version: Option<u8>,
     filters_registered: fixedbitset::FixedBitSet,
     phantom: marker::PhantomData<Ctx>,
 }
@@ -331,7 +328,6 @@ impl<Ctx: DemuxContext> PmtProcessor<Ctx> {
         PmtProcessor {
             pid,
             program_number,
-            current_version: None,
             filters_registered: fixedbitset::FixedBitSet::with_capacity(packet::Pid::PID_COUNT),
             phantom: marker::PhantomData,
         }
@@ -341,7 +337,7 @@ impl<Ctx: DemuxContext> PmtProcessor<Ctx> {
         &mut self,
         ctx: &mut Ctx,
         header: &psi::SectionCommonHeader,
-        table_syntax_header: &psi::TableSyntaxHeader<'_>,
+        _table_syntax_header: &psi::TableSyntaxHeader<'_>,
         sect: &PmtSection<'_>,
     ) {
         if 0x02 != header.table_id {
@@ -357,7 +353,7 @@ impl<Ctx: DemuxContext> PmtProcessor<Ctx> {
             let pes_packet_consumer = ctx.construct(FilterRequest::ByStream {
                 program_pid: self.pid,
                 stream_type: stream_info.stream_type(),
-                pmt: &sect,
+                pmt: sect,
                 stream_info: &stream_info,
             });
             ctx.filter_changeset()
@@ -369,8 +365,6 @@ impl<Ctx: DemuxContext> PmtProcessor<Ctx> {
         // remove filters for descriptors we've seen before that are not present in this updated
         // table,
         self.remove_outdated(ctx, pids_seen);
-
-        self.current_version = Some(table_syntax_header.version());
     }
 
     fn remove_outdated(&mut self, ctx: &mut Ctx, pids_seen: fixedbitset::FixedBitSet) {
@@ -418,6 +412,14 @@ pub enum DemuxError {
     },
 }
 
+type PacketFilterConsumer<Proc> = psi::SectionPacketConsumer<
+    psi::SectionSyntaxSectionProcessor<
+        psi::DedupSectionSyntaxPayloadParser<
+            psi::BufferSectionSyntaxParser<psi::CrcCheckWholeSectionSyntaxPayloadParser<Proc>>,
+        >,
+    >,
+>;
+
 /// `PacketFilter` implementation which will insert some other `PacketFilter` into the `Demultiplex`
 /// instance for each sub-stream listed in one of the stream's PMT-sections.
 ///
@@ -425,15 +427,7 @@ pub enum DemuxError {
 /// [`DemuxContxt::construct()`](trait.DemuxContext.html), passing a
 /// [`FilterRequest::ByStream`](enum.FilterRequest.html#variant.ByStream) request.
 pub struct PmtPacketFilter<Ctx: DemuxContext + 'static> {
-    pmt_section_packet_consumer: psi::SectionPacketConsumer<
-        psi::SectionSyntaxSectionProcessor<
-            psi::DedupSectionSyntaxPayloadParser<
-                psi::BufferSectionSyntaxParser<
-                    psi::CrcCheckWholeSectionSyntaxPayloadParser<PmtProcessor<Ctx>>,
-                >,
-            >,
-        >,
-    >,
+    pmt_section_packet_consumer: PacketFilterConsumer<PmtProcessor<Ctx>>,
 }
 impl<Ctx: DemuxContext> PmtPacketFilter<Ctx> {
     /// creates a new `PmtPacketFilter` for PMT sections in packets with the given `Pid`, and for
@@ -460,8 +454,6 @@ impl<Ctx: DemuxContext> PacketFilter for PmtPacketFilter<Ctx> {
 }
 
 struct PatProcessor<Ctx: DemuxContext> {
-    #[allow(dead_code)]
-    current_version: Option<u8>,
     filters_registered: fixedbitset::FixedBitSet, // TODO: https://crates.io/crates/typenum_bitset ?
     phantom: marker::PhantomData<Ctx>,
 }
@@ -469,7 +461,6 @@ struct PatProcessor<Ctx: DemuxContext> {
 impl<Ctx: DemuxContext> Default for PatProcessor<Ctx> {
     fn default() -> PatProcessor<Ctx> {
         PatProcessor {
-            current_version: None,
             filters_registered: fixedbitset::FixedBitSet::with_capacity(packet::Pid::PID_COUNT),
             phantom: marker::PhantomData,
         }
@@ -480,7 +471,7 @@ impl<Ctx: DemuxContext> PatProcessor<Ctx> {
         &mut self,
         ctx: &mut Ctx,
         header: &psi::SectionCommonHeader,
-        table_syntax_header: &psi::TableSyntaxHeader<'_>,
+        _table_syntax_header: &psi::TableSyntaxHeader<'_>,
         sect: &pat::PatSection<'_>,
     ) {
         if 0x00 != header.table_id {
@@ -512,8 +503,6 @@ impl<Ctx: DemuxContext> PatProcessor<Ctx> {
         // remove filters for descriptors we've seen before that are not present in this updated
         // table,
         self.remove_outdated(ctx, pids_seen);
-
-        self.current_version = Some(table_syntax_header.version());
     }
 
     fn remove_outdated(&mut self, ctx: &mut Ctx, pids_seen: fixedbitset::FixedBitSet) {
@@ -573,15 +562,7 @@ pub trait DemuxContext: Sized {
 /// [`DemuxContext::construct()`](trait.DemuxContext.html), passing a
 /// [`FilterRequest::Pmt`](enum.FilterRequest.html#variant.Pmt) request.
 pub struct PatPacketFilter<Ctx: DemuxContext> {
-    pat_section_packet_consumer: psi::SectionPacketConsumer<
-        psi::SectionSyntaxSectionProcessor<
-            psi::DedupSectionSyntaxPayloadParser<
-                psi::BufferSectionSyntaxParser<
-                    psi::CrcCheckWholeSectionSyntaxPayloadParser<PatProcessor<Ctx>>,
-                >,
-            >,
-        >,
-    >,
+    pat_section_packet_consumer: PacketFilterConsumer<PatProcessor<Ctx>>,
 }
 impl<Ctx: DemuxContext> Default for PatPacketFilter<Ctx> {
     fn default() -> PatPacketFilter<Ctx> {
@@ -629,8 +610,8 @@ impl<Ctx: DemuxContext> Demultiplex<Ctx> {
         };
 
         result.processor_by_pid.insert(
-            packet::Pid::PAT,
-            ctx.construct(FilterRequest::ByPid(packet::Pid::PAT)),
+            psi::pat::PAT_PID,
+            ctx.construct(FilterRequest::ByPid(psi::pat::PAT_PID)),
         );
 
         result
@@ -659,6 +640,15 @@ impl<Ctx: DemuxContext> Demultiplex<Ctx> {
                     // drop packets that have transport_error_indicator set, on the assumption that
                     // the contents are nonsense
                     warn!("{:?} transport_error_indicator", pk.pid());
+                } else if pk.transport_scrambling_control()
+                    != TransportScramblingControl::NotScrambled
+                {
+                    // TODO: allow descrambler to be plugged in
+                    warn!(
+                        "{:?} dropping scrambled packet {:?}",
+                        pk.pid(),
+                        pk.transport_scrambling_control()
+                    );
                 } else {
                     this_proc.consume(ctx, &pk);
                     if !ctx.filter_changeset().is_empty() {
@@ -693,8 +683,8 @@ impl<Ctx: DemuxContext> Demultiplex<Ctx> {
 }
 
 #[cfg(test)]
-mod test {
-    use bitstream_io::{BitWriter, BE};
+pub(crate) mod test {
+    use bitstream_io::{BitWrite, BitWriter, BE};
     use hex_literal::*;
     use std::io;
 
@@ -715,7 +705,7 @@ mod test {
     impl NullDemuxContext {
         fn do_construct(&mut self, req: demultiplex::FilterRequest<'_, '_>) -> NullFilterSwitch {
             match req {
-                demultiplex::FilterRequest::ByPid(packet::Pid::PAT) => {
+                demultiplex::FilterRequest::ByPid(psi::pat::PAT_PID) => {
                     NullFilterSwitch::Pat(demultiplex::PatPacketFilter::default())
                 }
                 demultiplex::FilterRequest::ByPid(_) => {
@@ -816,7 +806,7 @@ mod test {
         }
     }
 
-    fn make_test_data<F>(builder: F) -> Vec<u8>
+    pub(crate) fn make_test_data<F>(builder: F) -> Vec<u8>
     where
         F: Fn(&mut BitWriter<Vec<u8>, BE>) -> Result<(), io::Error>,
     {

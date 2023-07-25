@@ -1,5 +1,41 @@
 # Changelog
 
+<!-- next-header -->
+
+## Unreleased - FutureDate
+
+## 0.15.0 - 2021-04-17
+
+### Changed
+ - `Iso639LanguageDescriptor::languages()` now produces `Result<Language>` rather than just `Language`
+ - Since we don't support decryption, scrambled TS packets (packets with values of `transport_scrambling_control` other
+   than `0`) are now dropped, to prevent the application being passed bogus data
+ - `AdaptationFieldExtension::new()`  changed to return `Result`
+
+### Fixed
+ - Fixed a panic when parsing truncated PMT data
+ - Fixed a panic when parsing a truncated descriptor value
+ - Fixed a panic when parsing a truncated language code in `iso_639_language_descriptor`
+ - Fixed a panic when reported PES header length does not fit within available space
+ - Fixed a panic due to a bug parsing PES header `ESCR_base` field
+ - Fixes a panic when `PES_header_data_length` is not long enough to accommodate all the headers actually present
+ - Fixed so we accept very short but still syntactically valid PSI sections previously rejected in some cases
+ - Fixed a panic on TS packet with `adaptation_field_extension_flag` set, but `adaptation_field_extension_length` is `0`
+
+## 0.14.0 - 2021-04-11
+### Changed
+ - The `pes::ElementaryStreamConsumer` type and its methods are now parameterised to gain access to the context object
+   you provided to the demultiplexer.  Thanks @fkaa.
+ - `RegistrationDescriptor::format_identifier()` return type changed from u32 to a value of the `FormatIdentifier` enum
+   from the [smptera-format-identifiers-rust](https://crates.io/crates/smptera-format-identifiers-rust) crate.  Also
+   `RegistrationDescriptor` fields are no longer public.
+ - `Pid::new()` is now a `const` function.  Other crates can now define `Pid` constants.
+ - Definitions of constants for 'PAT' and 'stuffing' PIDs have been relocated, now that don't have to be in the same
+   module as the `Pid` type.
+
+### Added
+ - Implementation of `TryFrom<u16>` for `Pid`
+
 ## 0.13.0
 ### Changed
  - The `descriptor_enum!{}` macro no longer provides a default case (which used to produce `Error`), so callers which don't define

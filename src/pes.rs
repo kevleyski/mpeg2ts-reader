@@ -110,7 +110,7 @@ where
 
     #[inline(always)]
     fn consume(&mut self, ctx: &mut Self::Ctx, packet: &packet::Packet<'_>) {
-        if !self.is_continuous(&packet) {
+        if !self.is_continuous(packet) {
             self.stream_consumer.continuity_error(ctx);
             self.state = PesState::IgnoreRest;
         }
@@ -165,7 +165,7 @@ pub enum PesLength {
 /// Values which may be returned by
 /// [`PesHeader::stream_id()`](struct.PesHeader.html#method.stream_id) to identify the kind of
 /// content within the Packetized Elementary Stream.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum StreamId {
     /// `program_stream_map`
     ProgramStreamMap,
@@ -217,17 +217,17 @@ pub enum StreamId {
 }
 impl StreamId {
     fn is_parsed(&self) -> bool {
-        match self {
+        !matches!(
+            self,
             StreamId::ProgramStreamMap
-            | StreamId::PaddingStream
-            | StreamId::PrivateStream2
-            | StreamId::EcmStream
-            | StreamId::EmmStream
-            | StreamId::ProgramStreamDirectory
-            | StreamId::DsmCc
-            | StreamId::H2221TypeE => false,
-            _ => true,
-        }
+                | StreamId::PaddingStream
+                | StreamId::PrivateStream2
+                | StreamId::EcmStream
+                | StreamId::EmmStream
+                | StreamId::ProgramStreamDirectory
+                | StreamId::DsmCc
+                | StreamId::H2221TypeE
+        )
     }
 }
 impl From<u8> for StreamId {
@@ -277,6 +277,8 @@ pub struct PesHeader<'buf> {
     buf: &'buf [u8],
 }
 impl<'buf> PesHeader<'buf> {
+    const FIXED_HEADER_SIZE: usize = 6;
+
     /// Wraps the given slice in a PesHeader, which will then provide method to parse the header
     /// fields within the slice.
     ///
@@ -287,7 +289,7 @@ impl<'buf> PesHeader<'buf> {
     pub fn from_bytes(buf: &'buf [u8]) -> Option<PesHeader<'buf>> {
         // TODO: could the header straddle the boundary between TS packets?
         //       ..In which case we'd need to implement buffering.
-        if buf.len() < 6 {
+        if buf.len() < Self::FIXED_HEADER_SIZE {
             warn!("Buffer size {} too small to hold PES header", buf.len());
             return None;
         }
@@ -323,8 +325,7 @@ impl<'buf> PesHeader<'buf> {
     /// Either `PesContents::Parsed`, or `PesContents::Payload`, depending on the value of
     /// `stream_id()`
     pub fn contents(&self) -> PesContents<'buf> {
-        let header_len = 6;
-        let rest = &self.buf[header_len..];
+        let rest = &self.buf[Self::FIXED_HEADER_SIZE..];
         if self.stream_id().is_parsed() {
             PesContents::Parsed(PesParsedContents::from_bytes(rest))
         } else {
@@ -334,7 +335,7 @@ impl<'buf> PesHeader<'buf> {
 }
 
 /// Errors which may be encountered while processing PES data.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PesError {
     /// The value of an optional field was requested, but the field is not actually present in the
     /// given PES data
@@ -455,16 +456,16 @@ impl EsRate {
         self.0 * Self::RATE_BYTES_PER_SECOND
     }
 }
-impl Into<u32> for EsRate {
-    fn into(self) -> u32 {
-        self.0
+impl From<EsRate> for u32 {
+    fn from(r: EsRate) -> Self {
+        r.0
     }
 }
 
 /// TODO: not yet implemented
 #[derive(Debug)] // TODO manual Debug
 pub struct PesExtension<'buf> {
-    buf: &'buf [u8],
+    _buf: &'buf [u8],
 }
 
 /// Extra data which may optionally be present in the `PesHeader`, potentially including
@@ -481,7 +482,7 @@ impl<'buf> PesParsedContents<'buf> {
     ///
     /// TODO: return `Result`
     pub fn from_bytes(buf: &'buf [u8]) -> Option<PesParsedContents<'buf>> {
-        if buf.len() < 3 {
+        if buf.len() < Self::FIXED_HEADER_SIZE {
             warn!(
                 "buf not large enough to hold PES parsed header: {} bytes",
                 buf.len()
@@ -496,7 +497,24 @@ impl<'buf> PesParsedContents<'buf> {
             );
             return None;
         }
-        Some(PesParsedContents { buf })
+        let contents = PesParsedContents { buf };
+        if (Self::FIXED_HEADER_SIZE + contents.pes_header_data_len()) > buf.len() {
+            warn!(
+                "reported PES header length {} does not fit within remaining buffer length {}",
+                contents.pes_header_data_len(),
+                buf.len() - Self::FIXED_HEADER_SIZE,
+            );
+            return None;
+        }
+        if contents.pes_crc_end() > (Self::FIXED_HEADER_SIZE + contents.pes_header_data_len()) {
+            warn!(
+                "calculated PES header data length {} does not fit with in recorded PES_header_length {}",
+                contents.pes_crc_end() - Self::FIXED_HEADER_SIZE,
+                contents.pes_header_data_len(),
+            );
+            return None;
+        }
+        Some(contents)
     }
 
     /// value 1 indicates higher priority and 0 indicates lower priority
@@ -614,7 +632,7 @@ impl<'buf> PesParsedContents<'buf> {
         if self.escr_flag() {
             self.header_slice(self.pts_dts_end(), self.pts_dts_end() + Self::ESCR_SIZE)
                 .map(|s| {
-                    let base = u64::from(s[0] & 0b0011_1000) << 30
+                    let base = u64::from(s[0] & 0b0011_1000) << 27
                         | u64::from(s[0] & 0b0000_0011) << 28
                         | u64::from(s[1]) << 20
                         | u64::from(s[2] & 0b1111_1000) << 12
@@ -780,7 +798,7 @@ impl<'buf> PesParsedContents<'buf> {
                 self.pes_crc_end(),
                 self.pes_header_data_len() + Self::FIXED_HEADER_SIZE,
             )
-            .map(|s| PesExtension { buf: s })
+            .map(|s| PesExtension { _buf: s })
         } else {
             Err(PesError::FieldNotPresent)
         }
@@ -832,7 +850,7 @@ impl<'buf> fmt::Debug for PesParsedContents<'buf> {
 
 /// Detail about the formatting problem which prevented a [`Timestamp`](struct.Timestamp.html)
 /// value being parsed.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum TimestampError {
     /// Parsing the timestamp failed because the 'prefix-bit' values within the timestamp did not
     /// have the expected values
@@ -852,7 +870,7 @@ pub enum TimestampError {
 
 /// A 33-bit Elementary Stream timestamp, used to represent PTS and DTS values which may appear in
 /// an Elementary Stream header.
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Timestamp {
     val: u64,
 }
@@ -936,7 +954,7 @@ impl Timestamp {
 ///
 /// The timestamps will be wrapped in `Result`, in case an error in the stored timestamp syntax
 /// means that it can't be decoded.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum PtsDts {
     /// There are no timestamps present
     None,
@@ -958,7 +976,7 @@ pub enum PtsDts {
 ///
 /// Returned by
 /// [`PesParsedContents.data_alignment_indicator()`](struct.PesParsedContents.html#method.data_alignment_indicator)
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum DataAlignment {
     /// Access Units are aligned to the start of the PES packet payload
     Aligned,
@@ -968,7 +986,7 @@ pub enum DataAlignment {
 /// Indicates the copyright status of the contents of the Elementary Stream packet.
 ///
 /// Returned by [`PesParsedContents.copyright()`](struct.PesParsedContents.html#method.copyright)
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Copyright {
     /// Content of this Elementry Stream is protected by copyright
     Protected,
@@ -979,7 +997,7 @@ pub enum Copyright {
 ///
 /// Returned by
 /// [`PesParsedContents.original_or_copy()`](struct.PesParsedContents.html#method.original_or_copy)
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum OriginalOrCopy {
     /// The Elementary Stream is original content
     Original,
@@ -993,11 +1011,10 @@ mod test {
     use crate::demultiplex::PacketFilter;
     use crate::packet;
     use crate::pes;
-    use bitstream_io::BigEndian;
+    use assert_matches::assert_matches;
+    use bitstream_io::{BigEndian, BitWrite};
     use bitstream_io::{BitWriter, BE};
     use hex_literal::*;
-    use matches::assert_matches;
-    use std;
     use std::io;
 
     packet_filter_switch! {
@@ -1086,7 +1103,7 @@ mod test {
 
     #[test]
     fn parse_header() {
-        let data = make_test_data(|mut w| {
+        let data = make_test_data(|w| {
             w.write(24, 1)?; // packet_start_code_prefix
             w.write(8, 7)?; // stream_id
             w.write(16, 7)?; // PES_packet_length
@@ -1101,7 +1118,7 @@ mod test {
             w.write(1, 1)?; // ESCR_flag
             w.write(1, 1)?; // ES_rate_flag
             w.write(1, 1)?; // DSM_trick_mode_flag
-            w.write(1, 1)?; // additonal_copy_info_flag
+            w.write(1, 1)?; // additional_copy_info_flag
             w.write(1, 1)?; // PES_CRC_flag
             w.write(1, 0)?; // PES_extension_flag
             let pes_header_length = 5  // PTS
@@ -1111,9 +1128,9 @@ mod test {
                 + 1  // additional_copy_info
                 + 2; // previous_PES_packet_CRC
             w.write(8, pes_header_length)?; // PES_data_length (size of fields that follow)
-            write_ts(&mut w, 123456789, 0b0010)?; // PTS
-            write_escr(&mut w, 123456789, 234)?;
-            write_es_rate(&mut w, 1234567)?;
+            write_ts(w, 123456789, 0b0010)?; // PTS
+            write_escr(w, 0b111111111111111111111111111111111, 234)?;
+            write_es_rate(w, 1234567)?;
 
             // DSM_trick_mode,
             w.write(3, 0b00)?; // trick_mode_control (== fast_forward)
@@ -1153,7 +1170,7 @@ mod test {
                 assert_eq!(p.payload().len(), 0);
                 match p.escr() {
                     Ok(escr) => {
-                        assert_eq!(123456789, escr.base());
+                        assert_eq!(0b111111111111111111111111111111111, escr.base());
                         assert_eq!(234, escr.extension());
                     }
                     e => panic!("expected escr value, got {:?}", e),
@@ -1181,12 +1198,8 @@ mod test {
     #[test]
     fn pts() {
         let pts_prefix = 0b0010;
-        let pts = make_test_data(|mut w| {
-            write_ts(
-                &mut w,
-                0b1_0101_0101_0101_0101_0101_0101_0101_0101,
-                pts_prefix,
-            )
+        let pts = make_test_data(|w| {
+            write_ts(w, 0b1_0101_0101_0101_0101_0101_0101_0101_0101, pts_prefix)
         });
         let a = pes::Timestamp::from_pts_bytes(&pts[..]).unwrap().value();
         let b = 0b1_0101_0101_0101_0101_0101_0101_0101_0101;
@@ -1200,12 +1213,8 @@ mod test {
     #[test]
     fn dts() {
         let pts_prefix = 0b0001;
-        let pts = make_test_data(|mut w| {
-            write_ts(
-                &mut w,
-                0b0_1010_1010_1010_1010_1010_1010_1010_1010,
-                pts_prefix,
-            )
+        let pts = make_test_data(|w| {
+            write_ts(w, 0b0_1010_1010_1010_1010_1010_1010_1010_1010, pts_prefix)
         });
         let a = pes::Timestamp::from_dts_bytes(&pts[..]).unwrap().value();
         let b = 0b0_1010_1010_1010_1010_1010_1010_1010_1010;
@@ -1219,12 +1228,8 @@ mod test {
     #[test]
     fn timestamp_ones() {
         let pts_prefix = 0b0010;
-        let pts = make_test_data(|mut w| {
-            write_ts(
-                &mut w,
-                0b1_1111_1111_1111_1111_1111_1111_1111_1111,
-                pts_prefix,
-            )
+        let pts = make_test_data(|w| {
+            write_ts(w, 0b1_1111_1111_1111_1111_1111_1111_1111_1111, pts_prefix)
         });
         let a = pes::Timestamp::from_pts_bytes(&pts[..]).unwrap().value();
         let b = 0b1_1111_1111_1111_1111_1111_1111_1111_1111;
@@ -1238,12 +1243,8 @@ mod test {
     #[test]
     fn timestamp_zeros() {
         let pts_prefix = 0b0010;
-        let pts = make_test_data(|mut w| {
-            write_ts(
-                &mut w,
-                0b0_0000_0000_0000_0000_0000_0000_0000_0000,
-                pts_prefix,
-            )
+        let pts = make_test_data(|w| {
+            write_ts(w, 0b0_0000_0000_0000_0000_0000_0000_0000_0000, pts_prefix)
         });
         let a = pes::Timestamp::from_pts_bytes(&pts[..]).unwrap().value();
         let b = 0b0_0000_0000_0000_0000_0000_0000_0000_0000;
@@ -1257,7 +1258,7 @@ mod test {
     #[test]
     fn timestamp_bad_prefix() {
         let pts_prefix = 0b0010;
-        let mut pts = make_test_data(|mut w| write_ts(&mut w, 1234, pts_prefix));
+        let mut pts = make_test_data(|w| write_ts(w, 1234, pts_prefix));
         // make the prefix bits invalid by flipping a 0 to a 1,
         pts[0] |= 0b10000000;
         assert_matches!(
@@ -1272,7 +1273,7 @@ mod test {
     #[test]
     fn timestamp_bad_marker() {
         let pts_prefix = 0b0010;
-        let mut pts = make_test_data(|mut w| write_ts(&mut w, 1234, pts_prefix));
+        let mut pts = make_test_data(|w| write_ts(w, 1234, pts_prefix));
         // make the first maker_bit (at index 7) invalid, by flipping a 1 to a 0,
         pts[0] &= 0b11111110;
         assert_matches!(
@@ -1340,5 +1341,68 @@ mod test {
             let state = state.borrow();
             assert!(state.continuity_error_called);
         }
+    }
+
+    #[test]
+    fn header_length_doesnt_fit() {
+        let data = make_test_data(|w| {
+            w.write(24, 1)?; // packet_start_code_prefix
+            w.write(8, 7)?; // stream_id
+            w.write(16, 7)?; // PES_packet_length
+
+            w.write(2, 0b10)?; // check-bits
+            w.write(2, 0)?; // PES_scrambling_control
+            w.write(1, 0)?; // pes_priority
+            w.write(1, 1)?; // data_alignment_indicator
+            w.write(1, 0)?; // copyright
+            w.write(1, 0)?; // original_or_copy
+            w.write(2, 0b00)?; // PTS_DTS_flags
+            w.write(1, 0)?; // ESCR_flag
+            w.write(1, 0)?; // ES_rate_flag
+            w.write(1, 0)?; // DSM_trick_mode_flag
+            w.write(1, 0)?; // additional_copy_info_flag
+            w.write(1, 1)?; // PES_CRC_flag
+            w.write(1, 0)?; // PES_extension_flag
+            let pes_header_length = 2; // previous_PES_packet_CRC
+            w.write(8, pes_header_length)?; // PES_data_length (size of fields that follow)
+
+            // deliberately write 1 byte where 2 bytes are expected
+            w.write(8, 1) // INVALID previous_PES_packet_CRC
+        });
+        // the buffer generated is now one byte too short, so attempting to get the PES contents
+        // should fail,
+        let header = pes::PesHeader::from_bytes(&data[..]).unwrap();
+        assert!(matches!(header.contents(), pes::PesContents::Parsed(None)));
+    }
+
+    #[test]
+    fn pes_header_data_length_too_short() {
+        let data = make_test_data(|w| {
+            w.write(24, 1)?; // packet_start_code_prefix
+            w.write(8, 7)?; // stream_id
+            w.write(16, 7)?; // PES_packet_length
+
+            w.write(2, 0b10)?; // check-bits
+            w.write(2, 0)?; // PES_scrambling_control
+            w.write(1, 0)?; // pes_priority
+            w.write(1, 1)?; // data_alignment_indicator
+            w.write(1, 0)?; // copyright
+            w.write(1, 0)?; // original_or_copy
+            w.write(2, 0b00)?; // PTS_DTS_flags
+            w.write(1, 0)?; // ESCR_flag
+            w.write(1, 0)?; // ES_rate_flag
+            w.write(1, 0)?; // DSM_trick_mode_flag
+            w.write(1, 0)?; // additional_copy_info_flag
+            w.write(1, 1)?; // PES_CRC_flag
+            w.write(1, 0)?; // PES_extension_flag
+            let pes_header_length = 1; // invalid; we need two bytes for previous_PES_packet_CRC
+            w.write(8, pes_header_length)?; // PES_header_data_length (size of fields that follow)
+
+            // we put the correct number of bytes into the buffer, but the pes_header_length above
+            // doesn't reflect what's actually here
+            w.write(8, 2) // previous_PES_packet_CRC
+        });
+        let header = pes::PesHeader::from_bytes(&data[..]).unwrap();
+        assert!(matches!(header.contents(), pes::PesContents::Parsed(None)));
     }
 }

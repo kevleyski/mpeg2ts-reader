@@ -46,7 +46,17 @@ impl<'buf> PmtSection<'buf> {
                 actual: data.len(),
             })
         } else {
-            Ok(PmtSection { data })
+            let sect = PmtSection { data };
+            let expected = sect.program_info_length() as usize + Self::HEADER_SIZE;
+            if data.len() < expected {
+                Err(DemuxError::NotEnoughData {
+                    field: "descriptor",
+                    expected,
+                    actual: data.len(),
+                })
+            } else {
+                Ok(sect)
+            }
         }
     }
 
@@ -187,5 +197,67 @@ impl<'buf> fmt::Debug for StreamInfoDescriptorsDebug<'buf> {
         f.debug_list()
             .entries(self.0.descriptors::<descriptor::CoreDescriptors<'buf>>())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::demultiplex::test::make_test_data;
+    use crate::demultiplex::DemuxError;
+    use crate::descriptor::CoreDescriptors;
+    use crate::psi::pmt::PmtSection;
+    use assert_matches::assert_matches;
+    use bitstream_io::BitWrite;
+    use hex_literal::hex;
+
+    #[test]
+    fn debug_does_not_panic() {
+        let data = hex!("fd4df0001bfd4df00652010b70010411fd4ef01152010c0a04656e67007c025a007f02068211fd52f01252010d0a04656e67037c035880477f02060606fd51f00d5201055908656e671000010001");
+        let section = PmtSection::from_bytes(&data).unwrap();
+        // don't mind what it looks like, but it's embarrassing if it always panics!
+        assert!(!format!("{:?}", section).is_empty());
+    }
+
+    #[test]
+    fn far_too_small() {
+        let data = hex!("fd4df0");
+        assert_matches!(
+            PmtSection::from_bytes(&data),
+            Err(DemuxError::NotEnoughData {
+                expected: 4,
+                actual: 3,
+                ..
+            })
+        );
+    }
+
+    #[test]
+    fn descriptors_dont_fit() {
+        let data = make_test_data(|w| {
+            w.write(3, 0)?; // reserved
+            w.write(13, 123)?; // PCR_PID
+            w.write(4, 0)?; // reserved
+            w.write(12, 1) // program_info_length
+        });
+        // program_info_length claimed there is 1 byte of descriptor data, but there is no more
+        // data in the buffer
+        assert!(PmtSection::from_bytes(&data).is_err());
+    }
+
+    #[test]
+    fn truncated_descriptor() {
+        let data = make_test_data(|w| {
+            w.write(3, 0)?; // reserved
+            w.write(13, 4)?; // PCR_PID
+            w.write(4, 0)?; // reserved
+            w.write(12, 0x1)?; // program_info_length
+            w.write(8, 0x1) // descriptor_tag
+        });
+        // a descriptor needs to be at least two bytes (descriptor_tag + descriptor_length) but
+        // we only have one (descriptor_length missing)
+        let sect = PmtSection::from_bytes(&data).unwrap();
+        let mut iter = sect.descriptors::<CoreDescriptors<'_>>();
+        assert_matches!(iter.next(), Some(Err(_)));
+        assert_matches!(iter.next(), None);
     }
 }

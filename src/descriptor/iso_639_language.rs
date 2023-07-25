@@ -26,7 +26,7 @@ impl<'buf> Iso639LanguageDescriptor<'buf> {
     }
 
     /// Produce an iterator over the `Language` items in the provided buffer.
-    pub fn languages(&self) -> impl Iterator<Item = Language<'buf>> {
+    pub fn languages(&self) -> impl Iterator<Item = Result<Language<'buf>, LangError>> {
         LanguageIterator::new(self.buf)
     }
 }
@@ -42,21 +42,35 @@ impl<'buf> LanguageIterator<'buf> {
     }
 }
 impl<'buf> Iterator for LanguageIterator<'buf> {
-    type Item = Language<'buf>;
+    type Item = Result<Language<'buf>, LangError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.remaining_data.is_empty() {
             None
+        } else if self.remaining_data.len() < 4 {
+            let actual = self.remaining_data.len();
+            self.remaining_data = &self.remaining_data[0..0];
+            Some(Err(LangError::TooShort { actual }))
         } else {
             let (head, tail) = self.remaining_data.split_at(4);
             self.remaining_data = tail;
-            Some(Language::new(head))
+            Some(Ok(Language::new(head)))
         }
     }
 }
 
+/// An error reading a language code out of the descriptor
+#[derive(Debug)]
+pub enum LangError {
+    /// there is not sufficient data in the descriptor to read out another complete language code
+    TooShort {
+        /// the actual buffer size in bytes (expected size is 4 bytes)
+        actual: usize,
+    },
+}
+
 /// Metadata about the role of the audio elementary stream to which this descriptor is attached.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AudioType {
     /// The audio has no particular role define
     Undefined,
@@ -127,22 +141,38 @@ impl<'buf> fmt::Debug for Iso639LanguageDescriptor<'buf> {
 mod test {
     use super::super::{CoreDescriptors, Descriptor};
     use super::*;
-    use encoding;
+    use assert_matches::assert_matches;
     use hex_literal::*;
-    use matches::assert_matches;
 
     #[test]
     fn descriptor() {
         let data = hex!("0a04656e6700");
         let desc = CoreDescriptors::from_bytes(&data).unwrap();
-        if let CoreDescriptors::ISO639Language(iso_639_language) = desc {
+        assert_matches!(desc, CoreDescriptors::ISO639Language(iso_639_language) => {
             let mut langs = iso_639_language.languages();
-            let first = langs.next().unwrap();
+            let first = langs.next().unwrap().unwrap();
             assert_eq!("eng", first.code(encoding::DecoderTrap::Strict).unwrap());
             assert_eq!(AudioType::Undefined, first.audio_type());
             assert_matches!(langs.next(), None);
-        } else {
-            panic!("wrong descriptor type {:?}", desc);
+        });
+    }
+
+    #[test]
+    fn debug() {
+        let data = hex!("0a04656e6700");
+        let desc = CoreDescriptors::from_bytes(&data).unwrap();
+        assert_matches!(desc, CoreDescriptors::ISO639Language(iso_639_language) => {
+            assert!(!format!("{:?}", iso_639_language).is_empty());
+        });
+    }
+
+    #[test]
+    fn too_short() {
+        let data = hex!("0a03656e67");
+        let desc = CoreDescriptors::from_bytes(&data).unwrap();
+        if let CoreDescriptors::ISO639Language(iso_639_language) = desc {
+            let mut langs = iso_639_language.languages();
+            langs.next();
         }
     }
 }

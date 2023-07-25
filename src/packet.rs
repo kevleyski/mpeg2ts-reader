@@ -2,6 +2,8 @@
 
 use crate::pes;
 use log::warn;
+use std::cmp::Ordering;
+use std::convert::TryFrom;
 use std::fmt;
 
 /// the different values indicating whether a `Packet`'s `adaptation_field()` and `payload()`
@@ -128,7 +130,7 @@ impl ClockRef {
 }
 
 /// Some error encountered while parsing adaptation field syntax
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum AdaptationFieldError {
     /// The an optional field's value was requested, but the field is not actually present
     FieldNotPresent,
@@ -236,7 +238,7 @@ impl<'buf> AdaptationField<'buf> {
         }
     }
     fn transport_private_data_offset(&self) -> usize {
-        self.splice_countdown_offset() + if self.splicing_point_flag() { 1 } else { 0 }
+        self.splice_countdown_offset() + usize::from(self.splicing_point_flag())
     }
     /// Borrow a slice of the underlying buffer containing private data,
     /// or `AdaptationFieldError::FieldNotPresent` if absent
@@ -266,12 +268,31 @@ impl<'buf> AdaptationField<'buf> {
         if self.adaptation_field_extension_flag() {
             let off = self.adaptation_field_extension_offset()?;
             let len = self.slice(off, off + 1)?[0] as usize;
-            Ok(AdaptationFieldExtension::new(
-                self.slice(off + 1, off + 1 + len)?,
-            ))
+            AdaptationFieldExtension::new(self.slice(off + 1, off + 1 + len)?)
         } else {
             Err(AdaptationFieldError::FieldNotPresent)
         }
+    }
+}
+
+impl<'buf> fmt::Debug for AdaptationField<'buf> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("AdaptationField");
+        d.field("discontinuity_indicator", &self.discontinuity_indicator());
+        d.field("random_access_indicator", &self.random_access_indicator());
+        d.field(
+            "elementary_stream_priority_indicator",
+            &self.elementary_stream_priority_indicator(),
+        );
+        d.field("pcr", &self.pcr());
+        d.field("opcr", &self.opcr());
+        d.field("splice_countdown", &self.splice_countdown());
+        d.field("transport_private_data", &self.transport_private_data());
+        d.field(
+            "adaptation_field_extension",
+            &self.adaptation_field_extension(),
+        );
+        d.finish()
     }
 }
 
@@ -285,8 +306,12 @@ pub struct AdaptationFieldExtension<'buf> {
 impl<'buf> AdaptationFieldExtension<'buf> {
     /// Create a new structure to parse the adaptation field extension data held within the given
     /// slice.
-    pub fn new(buf: &'buf [u8]) -> AdaptationFieldExtension<'buf> {
-        AdaptationFieldExtension { buf }
+    pub fn new(buf: &'buf [u8]) -> Result<AdaptationFieldExtension<'buf>, AdaptationFieldError> {
+        if buf.is_empty() {
+            Err(AdaptationFieldError::NotEnoughData)
+        } else {
+            Ok(AdaptationFieldExtension { buf })
+        }
     }
 
     fn slice(&self, from: usize, to: usize) -> Result<&'buf [u8], AdaptationFieldError> {
@@ -354,10 +379,20 @@ impl<'buf> AdaptationFieldExtension<'buf> {
     }
 }
 
+impl<'buf> fmt::Debug for AdaptationFieldExtension<'buf> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("AdaptationFieldExtension");
+        d.field("ltw_offset", &self.ltw_offset());
+        d.field("piecewise_rate", &self.piecewise_rate());
+        d.field("seamless_splice", &self.seamless_splice());
+        d.finish()
+    }
+}
+
 /// Value of the _seamless_splice_ field, as returned by
 /// [`AdaptationFieldExtension::seamless_splice()`](struct.AdaptationFieldExtension.html#method.seamless_splice)
 /// method
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SeamlessSplice {
     /// see _ISO/IEC 13818-1 : 2000_, Table 2-7 through Table 2-16
     pub splice_type: u8,
@@ -370,7 +405,7 @@ pub struct SeamlessSplice {
 /// `adaptation_control` indicates that a payload should be present.
 ///
 /// See [`Packet.continuity_counter()`](struct.Packet.html#method.continuity_counter)
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct ContinuityCounter {
     val: u8,
 }
@@ -425,23 +460,28 @@ impl Pid {
     /// The total number of distinct PID values, `0x2000` (equal to `MAX_VALUE` + 1)
     pub const PID_COUNT: usize = (Self::MAX_VALUE + 1) as usize;
 
-    /// The identifier of TS Packets containing Program Association Table sections, with value `0`.
-    pub const PAT: Pid = Pid(0);
-    /// The identifier of TS Packets containing 'stuffing' data, with value `0x1fff`
-    pub const STUFFING: Pid = Pid(0x1fff);
+    #[doc(hidden)]
+    /// Use mpeg2ts_reader::psi::pat::PAT_PID instead of this
+    pub const PAT: Pid = Pid::new(0);
+    #[doc(hidden)]
+    /// Use mpeg2ts_reader::STUFFING_PID instead of this
+    pub const STUFFING: Pid = Pid::new(0x1fff);
 
     /// Panics if the given value is greater than `Pid::MAX_VALUE`.
-    #[inline]
-    pub fn new(pid: u16) -> Pid {
-        // Ideally, this would be a const fn, so that other code could define Pid constants too,
-        // however const fn's can't assert that the argument is valid, in current Rust.
-        assert!(
-            pid <= Self::MAX_VALUE,
-            "{} greater than pid max {}",
-            pid,
-            Self::MAX_VALUE
-        );
+    pub const fn new(pid: u16) -> Pid {
+        assert!(pid <= 0x1fff);
         Pid(pid)
+    }
+}
+impl TryFrom<u16> for Pid {
+    type Error = ();
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        if value <= Pid::MAX_VALUE {
+            Ok(Pid(value))
+        } else {
+            Err(())
+        }
     }
 }
 impl From<Pid> for u16 {
@@ -479,7 +519,7 @@ impl<'buf> Packet<'buf> {
     /// The fixed 188 byte size of a transport stream packet.
     pub const SIZE: usize = 188;
 
-    /// returns `true` if the given value is a valid synchronisation byte, the value `0x42`, which
+    /// returns `true` if the given value is a valid synchronisation byte, the value `Packet::SYNC_BYTE` (0x47), which
     /// must appear at the start of every transport stream packet.
     #[inline(always)]
     pub fn is_sync_byte(b: u8) -> bool {
@@ -620,17 +660,20 @@ impl<'buf> Packet<'buf> {
     #[inline]
     fn mk_payload(&self) -> Option<&'buf [u8]> {
         let offset = self.content_offset();
-        if offset == self.buf.len() {
-            warn!("no payload data present");
-            None
-        } else if offset > self.buf.len() {
-            warn!(
-                "adaptation_field_length {} too large",
-                self.adaptation_field_length()
-            );
-            None
-        } else {
-            Some(&self.buf[offset..])
+        let len = self.buf.len();
+        match offset.cmp(&len) {
+            Ordering::Equal => {
+                warn!("no payload data present");
+                None
+            }
+            Ordering::Greater => {
+                warn!(
+                    "adaptation_field_length {} too large",
+                    self.adaptation_field_length()
+                );
+                None
+            }
+            Ordering::Less => Some(&self.buf[offset..]),
         }
     }
 
@@ -655,6 +698,11 @@ impl<'buf> Packet<'buf> {
 mod test {
     use crate::packet::*;
     use crate::pes;
+
+    #[test]
+    fn pid() {
+        assert!(Pid::try_from(0x2000).is_err());
+    }
 
     #[test]
     #[should_panic]
@@ -715,6 +763,7 @@ mod test {
                 dts_next_au: pes::Timestamp::from_u64(0b1_1111_1111_1111_1111_1111_1111_1111_1111)
             })
         );
+        assert!(!format!("{:?}", pk.adaptation_field()).is_empty())
     }
 
     #[test]
@@ -728,5 +777,10 @@ mod test {
             AdaptationControl::AdaptationFieldAndPayload
         );
         assert!(pk.adaptation_field().is_none());
+    }
+
+    #[test]
+    fn empty_adaptation_field_extension() {
+        assert!(AdaptationFieldExtension::new(b"").is_err());
     }
 }

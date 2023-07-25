@@ -264,6 +264,9 @@ impl From<StreamType> for u8 {
     }
 }
 
+/// The identifier of TS Packets containing 'stuffing' data, with value `0x1fff`
+pub const STUFFING_PID: packet::Pid = packet::Pid::new(0x1fff);
+
 #[cfg(test)]
 mod test {
     use super::StreamType;
@@ -272,6 +275,19 @@ mod test {
     fn mappings() {
         for st in 0..=255 {
             assert_eq!(st, StreamType::from(st).into())
+        }
+    }
+
+    #[test]
+    fn pes() {
+        for st in 0..=255 {
+            let ty = StreamType::from(st);
+            match ty {
+                StreamType::H2220PrivateSections
+                | StreamType::Reserved(_)
+                | StreamType::Private(_) => assert!(!ty.is_pes(), "{:?}", ty),
+                _ => assert!(ty.is_pes(), "{:?}", ty),
+            }
         }
     }
 }

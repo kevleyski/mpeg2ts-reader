@@ -3,7 +3,6 @@ mpeg2ts-reader
 
 Rust reader for MPEG2 Transport Stream data
 
-[![Build Status](https://travis-ci.org/dholroyd/mpeg2ts-reader.svg?branch=master)](https://travis-ci.org/dholroyd/mpeg2ts-reader)
 [![crates.io version](https://img.shields.io/crates/v/mpeg2ts-reader.svg)](https://crates.io/crates/mpeg2ts-reader)
 [![Documentation](https://docs.rs/mpeg2ts-reader/badge.svg)](https://docs.rs/mpeg2ts-reader)
 [![Coverage Status](https://coveralls.io/repos/github/dholroyd/mpeg2ts-reader/badge.svg)](https://coveralls.io/github/dholroyd/mpeg2ts-reader)
@@ -229,6 +228,7 @@ and what's yet to come:
 - Transport Stream packet
   - [x] Fixed headers
   - [x] Adaptation field
+  - [ ] TS-level scrambling (values of `transport_scrambling_control` other than `0`) not supported
 - Program Specific Information tables
   - [x] Section syntax
   - [ ] 'Multi-section' tables
